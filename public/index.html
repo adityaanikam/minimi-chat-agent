@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat agent</title>
+<style>
+  :root { --bg:#fbfaf8; --panel:#f1efea; --ink:#1d1d1b; --muted:#6b6862; --line:#e2dfd8; --accent:#2f5d50; --chip:#e8efe9; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --panel:#1f1e1c; --ink:#ecebe7; --muted:#9a978f; --line:#2e2d2a; --accent:#8cc3ae; --chip:#23302b; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); display:flex; height:100vh; }
+  aside { width:250px; background:var(--panel); border-right:1px solid var(--line); padding:12px; overflow:auto; flex-shrink:0; }
+  aside button { width:100%; padding:8px; margin-bottom:10px; border:1px solid var(--line); background:var(--bg); color:var(--ink); border-radius:8px; cursor:pointer; }
+  .thread { padding:7px 8px; border-radius:6px; cursor:pointer; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .thread:hover, .thread.on { background:var(--bg); }
+  .thread small { display:block; color:var(--muted); font-size:11px; }
+  main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #log { flex:1; overflow:auto; padding:24px max(16px, calc(50% - 380px)); }
+  .msg { margin:0 0 22px; }
+  .user { background:var(--panel); padding:10px 14px; border-radius:12px; width:fit-content; max-width:85%; margin-left:auto; white-space:pre-wrap; }
+  .meta { color:var(--muted); font-size:12px; margin:4px 0; display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { background:var(--chip); padding:2px 8px; border-radius:10px; }
+  .warn p { margin:4px 0; font-size:13px; color:#8a5a00; background:#fff6e0;
+            border-left:3px solid #e0a800; padding:6px 10px; border-radius:4px; }
+  @media (prefers-color-scheme: dark) {
+    .warn p { color:#ffd480; background:#3a2d10; border-left-color:#b8860b; }
+  }
+  .answer p { margin:0 0 10px; }
+  .answer ul, .answer ol { margin:0 0 10px; padding-left:22px; }
+  .answer a.cite { font-size:11px; vertical-align:super; text-decoration:none; color:var(--accent); }
+  .sources { font-size:12px; color:var(--muted); border-top:1px solid var(--line); margin-top:8px; padding-top:6px; }
+  .sources a { color:var(--accent); }
+  form { display:flex; gap:8px; padding:12px max(16px, calc(50% - 380px)) 20px; }
+  textarea { flex:1; resize:none; padding:10px 12px; border:1px solid var(--line); border-radius:10px; font:inherit; background:var(--panel); color:var(--ink); }
+  form button { padding:0 18px; border:0; border-radius:10px; background:var(--accent); color:var(--bg); font-weight:600; cursor:pointer; }
+  @media (max-width: 700px) { aside { display:none; } }
+</style>
+</head>
+<body>
+<aside>
+  <button id="new">+ New chat</button>
+  <div id="threads"></div>
+</aside>
+<main>
+  <div id="log"></div>
+  <form id="f">
+    <textarea id="q" rows="2" placeholder="Ask anything. I search the web and remember our past chats." autofocus></textarea>
+    <button>Send</button>
+  </form>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+let threadId = null;
+const tzOffset = -new Date().getTimezoneOffset();
+
+function esc(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+// Small markdown subset: paragraphs, lists, bold, inline code, links, [n] citations.
+function render(md, sources) {
+  const byN = Object.fromEntries((sources || []).map((s) => [s.n, s]));
+  const inline = (t) => esc(t)
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (m, ns) => ns.split(/\s*,\s*/).map((n) =>
+      byN[n] ? `<a class="cite" href="${esc(byN[n].url)}" target="_blank" rel="noopener" title="${esc(byN[n].title)}">[${n}]</a>` : `[${n}]`).join(""));
+  const out = []; let list = null;
+  for (const line of md.split("\n")) {
+    const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)/);
+    if (li) { if (!list) { list = []; out.push(list); } list.push(inline(li[1])); continue; }
+    list = null;
+    if (line.trim()) out.push("<p>" + inline(line.replace(/^#+\s*/, "")) + "</p>");
+  }
+  return out.map((x) => Array.isArray(x) ? "<ul>" + x.map((i) => `<li>${i}</li>`).join("") + "</ul>" : x).join("");
+}
+
+function sourcesHtml(sources, text) {
+  const used = new Set([...text.matchAll(/\[(\d+)/g)].map((m) => +m[1]));
+  const list = sources.filter((s) => used.has(s.n));
+  if (!list.length) return "";
+  return '<div class="sources">' + list.map((s) =>
+    `[${s.n}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a> · ${esc(new URL(s.url).hostname)}${s.published ? " · " + esc(s.published.slice(0, 16)) : ""}`).join("<br>") + "</div>";
+}
+
+function add(cls, html) { const d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html; $("#log").append(d); $("#log").scrollTop = 1e9; return d; }
+
+async function loadThreads() {
+  const ts = await (await fetch("/api/threads")).json();
+  $("#threads").innerHTML = ts.map((t) => `<div class="thread ${t.id === threadId ? "on" : ""}" data-id="${t.id}">${esc(t.title)}<small>${new Date(t.last_at).toLocaleString()}</small></div>`).join("");
+  document.querySelectorAll(".thread").forEach((el) => el.onclick = () => openThread(el.dataset.id));
+}
+
+async function openThread(id) {
+  threadId = id; $("#log").innerHTML = "";
+  for (const m of await (await fetch("/api/threads/" + id)).json()) {
+    if (m.role === "user") add("user", esc(m.content));
+    else add("", `<div class="meta">${new Date(m.created_at).toLocaleString()}</div><div class="answer">${render(m.content, [])}</div>`);
+  }
+  loadThreads();
+}
+
+$("#new").onclick = () => { threadId = null; $("#log").innerHTML = ""; loadThreads(); $("#q").focus(); };
+$("#q").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#f").requestSubmit(); } });
+
+$("#f").onsubmit = async (e) => {
+  e.preventDefault();
+  const message = $("#q").value.trim(); if (!message) return;
+  $("#q").value = "";
+  add("user", esc(message));
+  const box = add("", '<div class="meta"><span class="chip">thinking…</span></div><div class="warn"></div><div class="answer"></div><div class="src"></div>');
+  const meta = box.querySelector(".meta"), ans = box.querySelector(".answer"), src = box.querySelector(".src");
+  const warn = box.querySelector(".warn");
+  let text = "", sources = [], chips = [], warnings = [];
+  const setMeta = (extra) => meta.innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("") + (extra || "");
+  const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, threadId, tzOffset }) });
+  const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const ev = JSON.parse(buf.slice(6, i)); buf = buf.slice(i + 2);
+      if (ev.type === "thread") threadId = ev.threadId;
+      if (ev.type === "memory") { chips.push(`recalled ${ev.exchanges} earlier exchange${ev.exchanges > 1 ? "s" : ""}`); setMeta(); }
+      if (ev.type === "search") { chips.push("searched: " + ev.query + (ev.since ? ` (since ${ev.since})` : "")); setMeta(); }
+      if (ev.type === "sources") sources = ev.sources;
+      if (ev.type === "text") { text += ev.text; ans.innerHTML = render(text, sources); if (!chips.length) setMeta(); }
+      if (ev.type === "done") { ans.innerHTML = render(text, sources); src.innerHTML = sourcesHtml(sources, text);
+        setMeta(`<span>first words ${(ev.firstTextMs / 1000).toFixed(1)} s · done ${(ev.totalMs / 1000).toFixed(1)} s</span>`); }
+      // Warnings say the answer is thinner or later than it should be: a rate-limit wait, a model
+      // downgrade, a citation with no source behind it. They belong above the answer, not in a log.
+      if (ev.type === "warning") { warnings.push(ev.message); warn.innerHTML = warnings.map((w) => `<p>${esc(w)}</p>`).join(""); }
+      if (ev.type === "error") { ans.innerHTML = `<p><b>Error:</b> ${esc(ev.message)}</p>`; setMeta(); }
+      $("#log").scrollTop = 1e9;
+    }
+  }
+  loadThreads();
+};
+loadThreads();
+</script>
+</body>
+</html>
